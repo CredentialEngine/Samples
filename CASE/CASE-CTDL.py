@@ -2,14 +2,15 @@
 import json
 import uuid
 import os
+import re
 from collections import OrderedDict
 from urllib.request import urlopen, Request
 from urllib.parse import urlparse
 from urllib.error import URLError, HTTPError
 
 # Contexts
-CTDL_CONTEXT = "https://credreg.net/ctdl/schema/context/json"        # Courses
-CTDLASN_CONTEXT = "https://credreg.net/ctdlasn/schema/context/json"  # Competency frameworks (old one)
+CTDL_CONTEXT = "https://credreg.net/ctdl/schema/context/json"        # Courses (CTDL)
+CTDLASN_CONTEXT = "https://credreg.net/ctdlasn/schema/context/json"  # Competency frameworks (CTDL-ASN)
 
 DEFAULT_REG_BASE = "https://credentialengineregistry.org/resources/"
 
@@ -56,7 +57,40 @@ def is_registry_ce_uri(value: str, reg_base: str = DEFAULT_REG_BASE) -> bool:
         return False
     return value.startswith(reg_base + "ce-")
 
-def build_and_write(pkg, reg_base, courses_outdir, frameworks_outdir):
+# Extract description from a CASE notes field that contains a "**Course Description:**" section.
+def extract_course_description(notes: str) -> str | None:
+    if not isinstance(notes, str) or not notes.strip():
+        return None
+    pattern = r"(?:\*\*Course Description:\*\*|Course Description:)\s*(.+?)(?:\n\s*\n\*\*[^*\n]+:\*\*|\Z)"
+    m = re.search(pattern, notes, flags=re.DOTALL | re.IGNORECASE)
+    if not m:
+        return None
+    desc = m.group(1).strip()
+    desc = re.sub(r"\r\n?", "\n", desc)
+    desc = re.sub(r"[ \t]+\n", "\n", desc)
+    desc = re.sub(r"\n{3,}", "\n\n", desc)
+    return desc if desc else None
+
+def extract_ctid(value: str) -> str:
+    """Return a ce-... CTID from a CE registry URI or raw CTID; add ce- if missing."""
+    if not value:
+        return ""
+    s = value.strip()
+    if s.startswith("http"):
+        tail = s.rstrip("/").split("/")[-1]
+        return tail if tail.startswith("ce-") else tail
+    return s if s.startswith("ce-") else f"ce-{s}"
+
+def build_and_write(pkg, publisher_uris, publisher_ctid, owned_by_list, offered_by_list,
+                    reg_base=DEFAULT_REG_BASE,
+                    courses_outdir="courses_out",
+                    frameworks_outdir="frameworks_out"):
+    """
+    publisher_uris: list[str] CE registry URIs for ceasn:publisher (must be non-empty list)
+    publisher_ctid: str CTID (ce-...) for Graph Publish wrapper
+    owned_by_list: list[str] of CE registry URIs
+    offered_by_list: list[str] of CE registry URIs (optional; may be empty)
+    """
     root = pkg.get("CFPackage") or pkg
     cfdoc = root.get("CFDocument") or {}
     items = root.get("CFItems") or []
@@ -69,7 +103,6 @@ def build_and_write(pkg, reg_base, courses_outdir, frameworks_outdir):
     fw_lang = _to_str(cfdoc.get("language")).strip() if cfdoc.get("language") else None
     fw_doc_uri = cfdoc.get("CFDocumentURI") or cfdoc.get("officialSourceURL") or None
     fw_publisher_name = _to_str(cfdoc.get("publisher")) if cfdoc.get("publisher") else None
-    fw_desc_text = _to_str(cfdoc.get("description") or "").strip()
 
     # Index items and keep input order
     item_by_ident, ordered_idents, item_uri_by_ident = {}, [], {}
@@ -81,7 +114,6 @@ def build_and_write(pkg, reg_base, courses_outdir, frameworks_outdir):
         item_by_ident[ident] = it
         item_uri_by_ident[ident] = it.get("uri") or it.get("CFItemURI") or ""
 
-    # Resolve endpoints by GUID only
     def resolve_endpoint(raw):
         if raw is None:
             return None
@@ -96,8 +128,8 @@ def build_and_write(pkg, reg_base, courses_outdir, frameworks_outdir):
         return t in ("ischildof", "ispartof")
 
     # Build hierarchy (destination = parent, origin = child) and capture sequenceNumber
-    children_of = OrderedDict()  # parent -> [child ...] in input order
-    seq_for_child = {}           # child -> first sequenceNumber seen
+    children_of = OrderedDict()
+    seq_for_child = {}
     for a in assocs:
         if not is_childof_type(a.get("associationType")):
             continue
@@ -115,6 +147,20 @@ def build_and_write(pkg, reg_base, courses_outdir, frameworks_outdir):
     competencies = OrderedDict()
     courses = OrderedDict()
 
+    # Constant lifecycle object to attach to every course
+    lifecycle_alignment = {
+        "@type": "ceterms:CredentialAlignmentObject",
+        "ceterms:framework": "https://credreg.net/ctdl/terms/LifeCycleStatus",
+        "ceterms:targetNode": "lifeCycle:Active",
+        "ceterms:frameworkName": {"en-US": "Life Cycle Status"},
+        "ceterms:targetNodeName": {"en-US": "Active"},
+        "ceterms:targetNodeDescription": {
+            "en-US": "Resource is active, current, ongoing, offered, operational, or available."
+        }
+    }
+
+    course_desc_by_ident = {}
+
     for ident in ordered_idents:
         it = item_by_ident[ident]
         ce_ctid = ident if ident.startswith("ce-") else f"ce-{ident}"
@@ -123,19 +169,34 @@ def build_and_write(pkg, reg_base, courses_outdir, frameworks_outdir):
         hcs = _to_str(it.get("humanCodingScheme")).strip()
 
         if is_course(it):
+            desc_from_notes = extract_course_description(_to_str(it.get("notes")))
+            if desc_from_notes:
+                course_desc_by_ident[ident] = desc_from_notes
+
             name = _to_str(it.get("abbreviatedStatement") or it.get("fullStatement") or "").strip()
-            desc = _to_str(it.get("fullStatement") or "").strip()
+            fallback_desc = _to_str(it.get("fullStatement") or "").strip()
+
             course_node = {
                 "@id": ce_atid,
                 "@type": "ceterms:Course",
                 "ceterms:ctid": ce_ctid,
+                "ceterms:lifeCycleStatusType": lifecycle_alignment,
             }
+            if owned_by_list:
+                course_node["ceterms:ownedBy"] = owned_by_list
+            if offered_by_list:  
+                course_node["ceterms:offeredBy"] = offered_by_list
+
             if fw_lang:
                 course_node["ceterms:inLanguage"] = fw_lang
             if name:
                 course_node["ceterms:name"] = {fw_lang: name} if fw_lang else name
-            if desc and desc != name:
-                course_node["ceterms:description"] = {fw_lang: desc} if fw_lang else desc
+
+            if desc_from_notes:
+                course_node["ceterms:description"] = {fw_lang: desc_from_notes} if fw_lang else desc_from_notes
+            elif fallback_desc and fallback_desc != name:
+                course_node["ceterms:description"] = {fw_lang: fallback_desc} if fw_lang else fallback_desc
+
             if hcs:
                 course_node["ceterms:codedNotation"] = hcs
             if item_uri_by_ident.get(ident):
@@ -181,7 +242,7 @@ def build_and_write(pkg, reg_base, courses_outdir, frameworks_outdir):
                 ordered.extend(expand_competency_subtree(ch, seen))
         return ordered
 
-    # Build ceterms:teaches for each course (parents + all descendants)
+    # Build ceterms:teaches
     for course_ident, course_node in courses.items():
         all_targets = []
         seen = set()
@@ -192,7 +253,6 @@ def build_and_write(pkg, reg_base, courses_outdir, frameworks_outdir):
             teaches = []
             for guid in all_targets:
                 comp = competencies[guid]
-                # choose a display name for targetNodeName
                 ttext = ""
                 if isinstance(comp.get("ceasn:competencyText"), dict) and fw_lang:
                     ttext = comp["ceasn:competencyText"].get(fw_lang, "")
@@ -211,34 +271,25 @@ def build_and_write(pkg, reg_base, courses_outdir, frameworks_outdir):
                 })
             course_node["ceterms:teaches"] = teaches
 
-    # Validation report structures (only add entries when there are errors)
+    # Validation report
     validation_report = {
         "frameworks": [],
         "competencies": [],
         "courses": [],
         "summary": {}
-    }
+        }
 
     def add_fw_validation(fw_node, errors):
         if errors:
-            validation_report["frameworks"].append({
-                "@id": fw_node.get("@id"),
-                "errors": errors
-            })
+            validation_report["frameworks"].append({"@id": fw_node.get("@id"), "errors": errors})
 
     def add_comp_validation(comp_node, errors):
         if errors:
-            validation_report["competencies"].append({
-                "@id": comp_node.get("@id"),
-                "errors": errors
-            })
+            validation_report["competencies"].append({"@id": comp_node.get("@id"), "errors": errors})
 
     def add_course_validation(course_node, errors):
         if errors:
-            validation_report["courses"].append({
-                "@id": course_node.get("@id"),
-                "errors": errors
-            })
+            validation_report["courses"].append({"@id": course_node.get("@id"), "errors": errors})
 
     # Validators
     def validate_framework(fw_node):
@@ -252,17 +303,13 @@ def build_and_write(pkg, reg_base, courses_outdir, frameworks_outdir):
         il = fw_node.get("ceasn:inLanguage")
         if not il or not isinstance(il, list) or not il[0]:
             errs.append("Missing ceasn:inLanguage")
-        pub = fw_node.get("ceasn:publisher")
-        if not pub:
-            errs.append("Missing ceasn:publisher (must be CE registry URI)")
-        elif isinstance(pub, list):
-            if not all(is_registry_ce_uri(p, reg_base) for p in pub):
-                errs.append("ceasn:publisher must be CE registry URI(s)")
-        elif isinstance(pub, str):
-            if not is_registry_ce_uri(pub, reg_base):
-                errs.append("ceasn:publisher must be CE registry URI")
+        pubs = fw_node.get("ceasn:publisher")
+        if not pubs or not isinstance(pubs, list) or not pubs:
+            errs.append("Missing/invalid ceasn:publisher (must be a non-empty list of CE registry URIs)")
         else:
-            errs.append("ceasn:publisher must be CE registry URI (string or list)")
+            bad = [p for p in pubs if not isinstance(p, str) or not is_registry_ce_uri(p, reg_base)]
+            if bad:
+                errs.append("ceasn:publisher must be CE registry URI(s)")
         return errs
 
     def validate_competency(c):
@@ -278,7 +325,6 @@ def build_and_write(pkg, reg_base, courses_outdir, frameworks_outdir):
 
     def validate_course(crs):
         errs = []
-        # Required identifiers and basic fields
         if not crs.get("ceterms:ctid"):
             errs.append("Missing ceterms:ctid")
         nm = crs.get("ceterms:name")
@@ -311,7 +357,6 @@ def build_and_write(pkg, reg_base, courses_outdir, frameworks_outdir):
 
         _validate_org_field(owned, "ceterms:ownedBy")
         _validate_org_field(offered, "ceterms:offeredBy")
-
         return errs
 
     total_competencies = 0
@@ -332,28 +377,29 @@ def build_and_write(pkg, reg_base, courses_outdir, frameworks_outdir):
         else:
             fw_name_val = _to_str(course_name_field)
 
+        fw_desc_text = course_desc_by_ident.get(course_ident)
+
         fw_node = {
             "@id": fw_atid,
             "@type": "ceasn:CompetencyFramework",
             "ceterms:ctid": fw_ctid,
             "ceasn:name": {fw_lang: fw_name_val} if fw_lang else fw_name_val,
+            "ceasn:publisher": publisher_uris,  # ALWAYS A LIST
         }
         if fw_lang:
             fw_node["ceasn:inLanguage"] = [fw_lang]
+        if fw_desc_text:
+            fw_node["ceasn:description"] = {fw_lang: fw_desc_text} if fw_lang else fw_desc_text
         if fw_doc_uri:
             fw_node["ceterms:subjectWebpage"] = fw_doc_uri
         if fw_publisher_name:
             fw_node["ceasn:publisherName"] = {fw_lang: fw_publisher_name} if fw_lang else fw_publisher_name
-        if fw_desc_text:
-            fw_node["ceasn:description"] = {fw_lang: fw_desc_text} if fw_lang else fw_desc_text
 
-        # Direct children of course are top children (parents) in order
         parent_roots = [c for c in children_of.get(course_ident, []) if c in competencies]
         fw_node["ceasn:hasTopChild"] = [
             reg_id(reg_base, (p if p.startswith("ce-") else f"ce-{p}"))
         for p in parent_roots] if parent_roots else []
 
-        # Build subtree (parents + descendants)
         subtree = []
         seen = set()
         for root in parent_roots:
@@ -367,7 +413,6 @@ def build_and_write(pkg, reg_base, courses_outdir, frameworks_outdir):
             node_copy["ceasn:isPartOf"] = fw_atid
             comp_nodes[guid] = node_copy
 
-        # Add local hasChild and reciprocal isChildOf
         for guid, node in comp_nodes.items():
             local_children = [c for c in children_of.get(guid, []) if c in comp_nodes]
             if local_children:
@@ -375,43 +420,50 @@ def build_and_write(pkg, reg_base, courses_outdir, frameworks_outdir):
                 for child_guid in local_children:
                     child_node = comp_nodes[child_guid]
                     parent_id = node["@id"]
-                    if "ceasn:isChildOf" not in child_node:
-                        child_node["ceasn:isChildOf"] = []
+                    child_node.setdefault("ceasn:isChildOf", [])
                     if parent_id not in child_node["ceasn:isChildOf"]:
                         child_node["ceasn:isChildOf"].append(parent_id)
 
-        # Fill course's teaches.framework + frameworkName now that framework exists
+        # Fill course teaches.framework + frameworkName
         if "ceterms:teaches" in course_node:
             for aln in course_node["ceterms:teaches"]:
                 aln["ceterms:framework"] = fw_atid
                 aln["ceterms:frameworkName"] = fw_node["ceasn:name"]
 
-        # Validate framework + its competencies now (only record if errors exist)
         fw_errs = validate_framework(fw_node)
         add_fw_validation(fw_node, fw_errs)
-
         for comp in comp_nodes.values():
             comp_errs = validate_competency(comp)
             add_comp_validation(comp, comp_errs)
 
-        # --- Write one JSON per framework (CTDLASN context) ---
         framework_graph = {
             "@context": CTDLASN_CONTEXT,
             "@id": fw_atid,
             "@graph": [fw_node] + list(comp_nodes.values())
         }
-        fw_filename = os.path.join(frameworks_outdir, f"framework_{course_ctid}.json")
-        with open(fw_filename, "w", encoding="utf-8") as f:
-            json.dump(framework_graph, f, ensure_ascii=False, indent=2)
-
-        # --- Write one JSON per course (CTDL context) ---
         course_graph_single = {
             "@context": CTDL_CONTEXT,
+            "@id": course_node["@id"], 
             "@graph": [course_node]
         }
+
+        publish_wrapper_framework = {
+            "PublishForOrganizationIdentifier": publisher_ctid,
+            "GraphInput": framework_graph
+        }
+        publish_wrapper_course = {
+            "PublishForOrganizationIdentifier": publisher_ctid,
+            "GraphInput": course_graph_single
+        }
+
+        # Write
+        fw_filename = os.path.join(frameworks_outdir, f"framework_{course_ctid}.json")
+        with open(fw_filename, "w", encoding="utf-8") as f:
+            json.dump(publish_wrapper_framework, f, ensure_ascii=False, indent=2)
+
         course_filename = os.path.join(courses_outdir, f"course_{course_ctid}.json")
         with open(course_filename, "w", encoding="utf-8") as f:
-            json.dump(course_graph_single, f, ensure_ascii=False, indent=2)
+            json.dump(publish_wrapper_course, f, ensure_ascii=False, indent=2)
 
         total_competencies += len(comp_nodes)
 
@@ -420,42 +472,110 @@ def build_and_write(pkg, reg_base, courses_outdir, frameworks_outdir):
         errs = validate_course(crs)
         add_course_validation(crs, errs)
 
-    # Summarize validations and totals
+    # Summary
     total_courses = len(courses)
     fw_err_count = len(validation_report["frameworks"])
     comp_err_count = len(validation_report["competencies"])
     course_err_count = len(validation_report["courses"])
 
     validation_report["summary"] = {
-        "framework_count": total_courses,            # 1 framework per course
-        "framework_error_count": fw_err_count,       # frameworks with errors
-        "competency_count": total_competencies,      # total competencies across frameworks
-        "competency_error_count": comp_err_count,    # competencies with errors
-        "course_count": total_courses,               # total courses written
-        "course_error_count": course_err_count       # courses with errors
+        "framework_count": total_courses,
+        "framework_error_count": fw_err_count,
+        "competency_count": total_competencies,
+        "competency_error_count": comp_err_count,
+        "course_count": total_courses,
+        "course_error_count": course_err_count
     }
 
     return validation_report
 
+def parse_ctids_to_registry_uris(raw: str, reg_base: str = DEFAULT_REG_BASE):
+    """Comma-separated CTIDs/URIs -> list of CE registry URIs."""
+    if not raw:
+        return []
+    parts = [p.strip() for p in raw.split(",") if p.strip()]
+    uris = []
+    for p in parts:
+        if p.startswith("http"):
+            uris.append(p)
+        else:
+            uris.append(reg_id(reg_base, p))
+    return uris
+
+def parse_publisher_list(raw: str, reg_base: str = DEFAULT_REG_BASE):
+    """
+    Accept publisher as one or more CTIDs/URIs (comma-separated).
+    Returns (publisher_uris_list, first_publisher_ctid_for_wrapper).
+    """
+    uris = parse_ctids_to_registry_uris(raw, reg_base)
+    first_ctid = extract_ctid(uris[0]) if uris else ""
+    return uris, first_ctid
+
+def yes_no(prompt: str) -> bool:
+    ans = input(prompt + " [y/N]: ").strip().lower()
+    return ans in ("y", "yes")
+
 def main():
+    # Defaults (no prompts for these)
+    courses_outdir = "courses_out"
+    frameworks_outdir = "frameworks_out"
+    out_valid = "validations.json"
+    reg_base = DEFAULT_REG_BASE
+
     try:
         url = input("Enter CASE CFPackage URL: ").strip()
-        courses_outdir = input("Output folder for COURSE files [courses_out]: ").strip() or "courses_out"
-        frameworks_outdir = input("Output folder for FRAMEWORK files [frameworks_out]: ").strip() or "frameworks_out"
-        out_valid = input("Validation report [validations.json]: ").strip() or "validations.json"
-        reg_base = input(f"Registry base URL [{DEFAULT_REG_BASE}]: ").strip() or DEFAULT_REG_BASE
+
+        # Publisher(s): LIST for framework; first is used in wrapper
+        publisher_raw = input(
+            "Enter publisher CTID(s) (comma-separated; e.g., ce-123..., 123..., or full CE URIs): "
+        ).strip()
+
+        # ownedBy (list; recommended)
+        owned_by_raw = input(
+            "Enter ownedBy CTID(s) for courses (comma-separated; ce-... or ... or full CE URIs). Leave blank if none: "
+        ).strip()
+
+        # offeredBy (optional; only ask if they want it)
+        add_offered = yes_no("Do you want to add offeredBy?")
+        offered_by_raw = ""
+        if add_offered:
+            offered_by_raw = input(
+                "Enter offeredBy CTID(s) for courses (comma-separated; ce-... or ... or full CE URIs): "
+            ).strip()
+
+        publisher_uris, publisher_ctid = parse_publisher_list(publisher_raw, reg_base)
+        owned_by_list = parse_ctids_to_registry_uris(owned_by_raw, reg_base)
+        offered_by_list = parse_ctids_to_registry_uris(offered_by_raw, reg_base) if add_offered else []
+
+        # Guards
+        if not publisher_uris:
+            raise ValueError("You must provide at least one publisher CTID/URI.")
+        if not publisher_ctid:
+            raise ValueError("Could not extract a valid publisher CTID for the graph wrapper.")
+        if not owned_by_list and not offered_by_list:
+            raise ValueError("You must provide at least one of ownedBy or offeredBy.")
 
         print("Fetching CASE package...")
         pkg = fetch_json(url)
         print("Creating individual course and framework JSON files...")
-        validation_report = build_and_write(pkg, reg_base, courses_outdir, frameworks_outdir)
+
+        validation_report = build_and_write(
+            pkg=pkg,
+            publisher_uris=publisher_uris,        
+            publisher_ctid=publisher_ctid,         
+            owned_by_list=owned_by_list,
+            offered_by_list=offered_by_list,
+            reg_base=reg_base,
+            courses_outdir=courses_outdir,
+            frameworks_outdir=frameworks_outdir
+        )
 
         with open(out_valid, "w", encoding="utf-8") as f:
             json.dump(validation_report, f, ensure_ascii=False, indent=2)
 
         summary = validation_report["summary"]
-        print(f"Created {summary['course_count']} course JSON files in '{courses_outdir}' (CTDL)")
-        print(f"Created {summary['framework_count']} framework JSON files in '{frameworks_outdir}' (CTDLASN)")
+        print(f"Created {summary['course_count']} course JSON files in '{courses_outdir}' ")
+        print(f"Created {summary['framework_count']} framework JSON files in '{frameworks_outdir}'")
         print("— Validation summary —")
         print(f"Framework errors:  {summary['framework_error_count']}")
         print(f"Competency errors: {summary['competency_error_count']}")
