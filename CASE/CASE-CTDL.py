@@ -99,8 +99,13 @@ def build_and_write(pkg, publisher_uris, publisher_ctid, owned_by_list, offered_
     os.makedirs(courses_outdir, exist_ok=True)
     os.makedirs(frameworks_outdir, exist_ok=True)
 
-    # Use CASE language exactly as provided (no normalization)
-    fw_lang = _to_str(cfdoc.get("language")).strip() if cfdoc.get("language") else None
+    # Use CASE language exactly as provided
+    # if languge is eng change it to en for publishing purposes
+    raw_lang = _to_str(cfdoc.get("language")).strip() if cfdoc.get("language") else None
+    if raw_lang and raw_lang.lower() == "eng":
+        fw_lang = "en"
+    else:
+        fw_lang = raw_lang
     fw_doc_uri = cfdoc.get("CFDocumentURI") or cfdoc.get("officialSourceURL") or None
     fw_publisher_name = _to_str(cfdoc.get("publisher")) if cfdoc.get("publisher") else None
 
@@ -188,7 +193,7 @@ def build_and_write(pkg, publisher_uris, publisher_ctid, owned_by_list, offered_
                 course_node["ceterms:offeredBy"] = offered_by_list
 
             if fw_lang:
-                course_node["ceterms:inLanguage"] = fw_lang
+                course_node["ceterms:inLanguage"] = [fw_lang]
             if name:
                 course_node["ceterms:name"] = {fw_lang: name} if fw_lang else name
 
@@ -209,7 +214,7 @@ def build_and_write(pkg, publisher_uris, publisher_ctid, owned_by_list, offered_
                 "ceterms:ctid": ce_ctid,
             }
             if fw_lang:
-                comp_node["ceasn:inLanguage"] = fw_lang
+                comp_node["ceasn:inLanguage"] = [fw_lang]
             fs = it.get("fullStatement")
             if fs:
                 comp_node["ceasn:competencyText"] = {fw_lang: fs} if fw_lang else fs
@@ -226,9 +231,9 @@ def build_and_write(pkg, publisher_uris, publisher_ctid, owned_by_list, offered_
                 comp_node["ceasn:listID"] = _to_str(it.get("listEnumInSource"))
             elif ident in seq_for_child:
                 comp_node["ceasn:listID"] = seq_for_child[ident]
-            # broadAlignment to CASE URI (as object with the URI key)
+            # broadAlignment to CASE URI is a list
             if uri:
-                comp_node["ceasn:broadAlignment"] = {uri: ""}
+                comp_node["ceasn:broadAlignment"] = [uri]
             competencies[ident] = comp_node
 
     # DFS expand (parent + descendants) in input order
@@ -392,8 +397,12 @@ def build_and_write(pkg, publisher_uris, publisher_ctid, owned_by_list, offered_
             fw_node["ceasn:description"] = {fw_lang: fw_desc_text} if fw_lang else fw_desc_text
         if fw_doc_uri:
             fw_node["ceterms:subjectWebpage"] = fw_doc_uri
-        if fw_publisher_name:
-            fw_node["ceasn:publisherName"] = {fw_lang: fw_publisher_name} if fw_lang else fw_publisher_name
+        if fw_publisher_name: # this is list too
+            if fw_lang:
+                fw_node["ceasn:publisherName"] = {fw_lang: [fw_publisher_name]}
+            else:
+                fw_node["ceasn:publisherName"] = [fw_publisher_name]
+
 
         parent_roots = [c for c in children_of.get(course_ident, []) if c in competencies]
         fw_node["ceasn:hasTopChild"] = [
@@ -449,7 +458,7 @@ def build_and_write(pkg, publisher_uris, publisher_ctid, owned_by_list, offered_
 
         publish_wrapper_framework = {
             "PublishForOrganizationIdentifier": publisher_ctid,
-            "GraphInput": framework_graph
+            "CompetencyFrameworkGraph": framework_graph
         }
         publish_wrapper_course = {
             "PublishForOrganizationIdentifier": publisher_ctid,
