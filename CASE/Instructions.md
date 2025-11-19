@@ -20,9 +20,17 @@ It also outputs **validation report** (`validations.json`) listing **items with 
 No package installation is required.
 Simply save the script (e.g., case_to_ctdl.py), open your terminal, and navigate to its folder:
 
+If you want to publish the courses and frameworks use the CASE-CTDL.py, please use the https://case.georgiastandards.org/ims/case/v1p1/CFPackages/caseidentifier
 ```bash
 cd /path/to/your/script
-python3 case_to_ctdl.py
+python3 CASE-CTDL.py
+```
+
+If you want to publish the learning programs use the CASEPathways-CTDLLearningPrograms.py, please use the https://case.georgiastandards.org/ims/case/vext/CFPackages/caseidentifier
+
+```bash
+cd /path/to/your/script
+python3 CASEPathways-CTDLLearningPrograms.py
 ```
 ## Inputs
 You’ll be prompted for:
@@ -59,10 +67,13 @@ Validation details saved to validations.json
 
 ## Output Files
 
+### CASE-CTDL.py
 - `courses_out/course_<COURSE_CTID>.json`
 - `frameworks_out/framework_<COURSE_CTID>.json`
 - `validations.json`- validation summary (frameworks, competencies, courses)
-
+### CASEPathways-CTDLLearningPrograms.py
+- `learningprograms_out/learningprogram_<LearningProgram_CTID>.json`
+- `validations_pathways.json`- validation summary (learning programs)
 
 ## Validation Rules
 
@@ -89,6 +100,18 @@ Validation details saved to validations.json
   - `ceterms:ctid`
   - `ceasn:competencyText`
   - `ceasn:isPartOf`
+
+### LearningPrograms (`ceterms:LearningProgram`)
+- Required:
+  - `ceterms:ctid`
+  - `ceterms:name`
+  - `ceterms:description`
+  - `ceterms:inLanguage`
+  - `ceterms:lifeCycleStatusType`
+  - **At least one of** `ceterms:ownedBy` **or** `ceterms:offeredBy`
+  -- `ceterms:isPreparationFor`
+- URI checks: `ownedBy` / `offeredBy` must be **CE Registry URIs**.
+
 
 The script writes `validations.json` with **only items that have errors**.
 
@@ -234,5 +257,70 @@ All outputs are **ready to POST** to the Registry’s **Graph Publish** endpoint
 }
 ```
 
+### Learning Programs(`ceterms:LearningProgram`)
+ **Learning Programs** are constructed from CASE `CFItems` whose type is `Pathway` (case-insensitive).
+- For each learning program, a **ceterms:conditionprofile** is added and linked to the related course:
+  - `ceterms:isPreparationFor`  is set as the condition profile name.
+  - `ceterms:targetLearningOpportunity` is backfilled with the course `@id`..
 
+All outputs are **ready to POST** to the Registry’s **Graph Publish** endpoint, given that the validation is succesful and there are no errors.
 
+```json
+{
+  "PublishForOrganizationIdentifier": "ce-14712aad-c6d4-4a3a-b271-d831cb865516",
+  "GraphInput": {
+    "@context": "https://credreg.net/ctdl/schema/context/json",
+    "@id": "https://credentialengineregistry.org/resources/ce-7c497f4c-951f-4665-8c1a-da4f34ec4930",
+    "@graph": [
+      {
+        "@id": "https://credentialengineregistry.org/resources/ce-7c497f4c-951f-4665-8c1a-da4f34ec4930",
+        "@type": "ceterms:LearningProgram",
+        "ceterms:ctid": "ce-7c497f4c-951f-4665-8c1a-da4f34ec4930",
+        "ceterms:lifeCycleStatusType": {
+          "@type": "ceterms:CredentialAlignmentObject",
+          "ceterms:framework": "https://credreg.net/ctdl/terms/LifeCycleStatus",
+          "ceterms:targetNode": "lifeCycle:Active",
+          "ceterms:frameworkName": {
+            "en-US": "Life Cycle Status"
+          },
+          "ceterms:targetNodeName": {
+            "en-US": "Active"
+          },
+          "ceterms:targetNodeDescription": {
+            "en-US": "Resource is active, current, ongoing, offered, operational, or available."
+          }
+        },
+        "ceterms:ownedBy": [
+          "https://credentialengineregistry.org/resources/ce-14712aad-c6d4-4a3a-b271-d831cb865516"
+        ],
+        "ceterms:inLanguage": [
+          "en"
+        ],
+        "ceterms:name": {
+          "en": "Business and Technology"
+        },
+        "ceterms:description": {
+          "en": "Business and Technology"
+        },
+        "ceterms:subjectWebpage": "https://case.georgiastandards.org/ims/case/v1p1/CFItems/7c497f4c-951f-4665-8c1a-da4f34ec4930",
+        "ceterms:isPreparationFor": [
+          {
+            "@type": "ceterms:ConditionProfile",
+            "ceterms:name": {
+              "en-US": "Is Preparation For"
+            },
+            "ceterms:description": {
+              "en-US": "Students who complete this CTAE pathway will be prepared to earn the following courses of value."
+            },
+            "ceterms:targetLearningOpportunity": [
+              "https://credentialengineregistry.org/resources/ce-099fee90-294c-42be-bcd1-dbb05bb0e023",
+              "https://credentialengineregistry.org/resources/ce-1ed12fe7-ad46-448e-b843-83d554c0a471",
+              "https://credentialengineregistry.org/resources/ce-eb9a1c5a-d61c-4580-a914-dbcfe4f0713d"
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}
+```
